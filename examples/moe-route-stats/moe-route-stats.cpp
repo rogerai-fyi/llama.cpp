@@ -73,6 +73,7 @@ struct route_stats {
     std::map<int, char> gate_biased;              // prefer the post-bias tensor
     std::map<int, char> logit_biased;             // same, for router scores
     std::map<std::string, int> seen_names;        // diagnostic: what actually fires
+    bool collect_gate = false;                    // expensive; opt in separately
     std::vector<uint8_t> scratch;
     std::vector<float>   lscratch;
     int64_t total_selections = 0;
@@ -106,7 +107,13 @@ struct route_stats {
     std::map<int, int> cand_ne, cand_nt;
     std::map<int, double> elect_agree;                              // winning agreement rate
     std::map<int, int64_t> check_tokens;             // tokens compared
-    std::map<int, int64_t> check_mismatch;           // tokens where the sets differ
+    std::map<int, int64_t> check_mismatch;           // non-tie-equivalent set differences
+    std::map<int, int64_t> check_tie_equivalent;     // different ids, valid tied top-k
+    // Some architectures route early layers by token-id lookup rather than a
+    // learned score (DeepSeek-V4's ffn_gate_tid2eid table). Those selections are
+    // valid for traffic histograms but have no continuous router score and must
+    // never enter score-based reachability analysis.
+    std::map<int, char>    hash_layers;
     std::map<int, char>    noncontig;                // score tensor was not contiguous
     int mismatch_reports = 0;
 };
@@ -151,7 +158,7 @@ static void try_elect(route_stats * st, int il) {
             const float * v = V.data() + (size_t) tk * ne;
             for (int i = 0; i < ne; ++i) idx[i] = i;
             std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
-                              [&](int a, int b) { return v[a] > v[b]; });
+                              [&](int a, int b) { return v[a] != v[b] ? v[a] > v[b] : a < b; });
             mine.assign(idx.begin(), idx.begin() + kk);
             theirs.clear();
             for (int j = 0; j < kk; ++j) {
@@ -224,7 +231,7 @@ static void try_compare(route_stats * st, int il) {
         const float * v = S + (size_t) tk * ne;
         for (int i = 0; i < ne; ++i) idx[i] = i;
         std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
-                          [&](int a, int b) { return v[a] > v[b]; });
+                          [&](int a, int b) { return v[a] != v[b] ? v[a] > v[b] : a < b; });
         mine.assign(idx.begin(), idx.begin() + kk);
         theirs.clear();
         for (int j = 0; j < kk; ++j) {
@@ -235,21 +242,41 @@ static void try_compare(route_stats * st, int il) {
         std::sort(theirs.begin(), theirs.end());
         st->check_tokens[il]++;
         if (mine != theirs) {
-            st->check_mismatch[il]++;
+            // Backends need not choose the same expert id at an exact cutoff
+            // tie. Validate the mathematical top-k condition: every selected
+            // score must be >= every unselected score. This distinguishes a
+            // backend tie policy from observing the wrong score tensor.
+            std::vector<char> selected(ne, 0);
+            for (int e : theirs) if (e >= 0 && e < ne) selected[e] = 1;
+            float min_selected = std::numeric_limits<float>::infinity();
+            float max_unselected = -std::numeric_limits<float>::infinity();
+            for (int e = 0; e < ne; ++e) {
+                if (selected[e]) min_selected = std::min(min_selected, v[e]);
+                else             max_unselected = std::max(max_unselected, v[e]);
+            }
+            const bool tie_equivalent =
+                (int) theirs.size() == kk && min_selected >= max_unselected;
+            if (tie_equivalent) st->check_tie_equivalent[il]++;
+            else                st->check_mismatch[il]++;
             if (st->mismatch_reports < 6) {
                 st->mismatch_reports++;
                 std::vector<int> rk(ne);
                 for (int i = 0; i < ne; ++i) rk[i] = i;
-                std::sort(rk.begin(), rk.end(), [&](int a, int b) { return v[a] > v[b]; });
+                std::sort(rk.begin(), rk.end(), [&](int a, int b) { return v[a] != v[b] ? v[a] > v[b] : a < b; });
                 std::vector<int> rank_of(ne, -1);
                 for (int r = 0; r < ne; ++r) rank_of[rk[r]] = r;
-                fprintf(stderr, "[selfcheck] L%d tok%d chose {", il, tk);
+                fprintf(stderr, "[selfcheck:%s] L%d tok%d predicted {",
+                        tie_equivalent ? "cutoff-tie" : "ERROR", il, tk);
+                for (size_t j = 0; j < mine.size(); ++j)
+                    fprintf(stderr, "%s%d", j ? "," : "", mine[j]);
+                fprintf(stderr, "} chose {");
                 for (size_t j = 0; j < theirs.size(); ++j)
                     fprintf(stderr, "%s%d", j ? "," : "", theirs[j]);
                 fprintf(stderr, "} ranks-in-our-scores {");
                 for (size_t j = 0; j < theirs.size(); ++j)
                     fprintf(stderr, "%s%d", j ? "," : "", rank_of[theirs[j]]);
-                fprintf(stderr, "}\n");
+                fprintf(stderr, "} cutoff(selected=%.9g unselected=%.9g)\n",
+                        min_selected, max_unselected);
             }
         }
     }
@@ -278,7 +305,8 @@ static bool cb_routes(struct ggml_tensor * t, bool ask, void * user_data) {
     const bool is_sep    = strncmp(t->name, "ffn_moe_gate", 12) == 0
                         && strstr(t->name, "_up") == nullptr;
     const bool is_gateup = is_merged || is_sep;
-    if (ask && is_gateup) return true;
+    if (is_gateup && !st->collect_gate) return false;
+    if (ask && is_gateup) return st->collect_gate;
     if (!ask && is_gateup && t->type == GGML_TYPE_F32) {
         const bool biased = strstr(t->name, "_biased") != nullptr;
         const int il = layer_of(t->name);
@@ -306,6 +334,14 @@ static bool cb_routes(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const bool is_topk   = strncmp(t->name, "ffn_moe_topk",   12) == 0;
+    if (is_topk && t->op == GGML_OP_GET_ROWS && t->src[0] != nullptr &&
+        strstr(t->src[0]->name, "ffn_gate_tid2eid") != nullptr) {
+        const int il = layer_of(t->name);
+        st->hash_layers[il] = 1;
+        st->cand.erase(il);
+        st->last_scores.erase(il);
+        st->last_topk.erase(il);
+    }
     // DeepSeek-style aux-loss-free load balancing adds a PER-EXPERT BIAS to the
     // score used for selection, so the top-k constraint is affine rather than
     // linear: (w_i - w_j).h > b_j - b_i. Judging on the pre-bias logits would be
@@ -422,7 +458,7 @@ static bool cb_routes(struct ggml_tensor * t, bool ask, void * user_data) {
     auto & hist = st->per_layer[il];
 
     // stash the selection; compare from whichever side arrives second
-    {
+    if (!st->hash_layers.count(il)) {
         auto & buf = st->last_topk[il];
         buf.resize((size_t) k_used * n_tok);
         for (int tk = 0; tk < n_tok; ++tk) {
@@ -483,6 +519,7 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     route_stats st;
+    st.collect_gate = getenv("MOE_STATS_COLLECT_GATE") != nullptr;
     params.cb_eval = cb_routes;
     params.cb_eval_user_data = &st;
     params.warmup = false;
@@ -538,6 +575,7 @@ int main(int argc, char ** argv) {
     const int n_expert = st.n_expert_guess;
     int64_t selfcheck_tokens = 0;
     int64_t selfcheck_mismatch = 0;
+    int64_t selfcheck_tie_equivalent = 0;
     for (auto & [il, v] : st.check_tokens) {
         (void) il;
         selfcheck_tokens += v;
@@ -545,6 +583,10 @@ int main(int argc, char ** argv) {
     for (auto & [il, v] : st.check_mismatch) {
         (void) il;
         selfcheck_mismatch += v;
+    }
+    for (auto & [il, v] : st.check_tie_equivalent) {
+        (void) il;
+        selfcheck_tie_equivalent += v;
     }
     const bool selfcheck_passed = selfcheck_tokens > 0 && selfcheck_mismatch == 0;
     LOG("\n");
@@ -578,7 +620,20 @@ int main(int argc, char ** argv) {
           << ",\n  \"self_check\": {\"tokens\": " << selfcheck_tokens
           << ", \"matches\": " << (selfcheck_tokens - selfcheck_mismatch)
           << ", \"mismatches\": " << selfcheck_mismatch
+          << ", \"cutoff_tie_equivalent\": " << selfcheck_tie_equivalent
+          << ", \"exact_id_sets\": "
+          << (selfcheck_tokens - selfcheck_mismatch - selfcheck_tie_equivalent)
           << ", \"passed\": " << (selfcheck_passed ? "true" : "false") << "}"
+          << ",\n  \"routing_kind\": {";
+        bool fr = true;
+        for (auto & [il, hist] : st.per_layer) {
+            (void) hist;
+            if (!fr) f << ",";
+            fr = false;
+            f << "\"" << il << "\":\""
+              << (st.hash_layers.count(il) ? "token_hash" : "learned_score") << "\"";
+        }
+        f << "}"
           << ",\n  \"median_experts_for\": {\"p50\": " << median_of(e50)
           << ", \"p80\": " << median_of(e80)
           << ", \"p90\": " << median_of(e90)
@@ -627,6 +682,8 @@ int main(int argc, char ** argv) {
               << (st.check_tokens.count(il) ? st.check_tokens.at(il) : 0)
               << ", \"selfcheck_mismatch\": "
               << (st.check_mismatch.count(il) ? st.check_mismatch.at(il) : 0)
+              << ", \"selfcheck_cutoff_tie_equivalent\": "
+              << (st.check_tie_equivalent.count(il) ? st.check_tie_equivalent.at(il) : 0)
               << ", \"noncontiguous\": " << (st.noncontig.count(il) ? 1 : 0) << "}";
         }
         f << "\n  },\n  \"gate_max\": {\n";
@@ -648,12 +705,20 @@ int main(int argc, char ** argv) {
         int nc = 0;
         for (auto & [il, v] : st.noncontig) { (void) il; (void) v; nc++; }
         LOG("\n  elected selection score per layer:\n");
+        if (!st.hash_layers.empty()) {
+            LOG("    token-hash layers (traffic only; score reachability N/A):");
+            for (auto & [il, v] : st.hash_layers) { (void) v; LOG(" %d", il); }
+            LOG("\n");
+        }
         for (auto & [il, nm] : st.chosen_score) {
             LOG("    layer %-3d %-24s (reproduced %.1f%% of the election ubatch)\n",
                 il, nm.c_str(), 100.0 * st.elect_agree[il]);
         }
-        LOG("\n  SELF-CHECK: %lld of %lld token-selections reproduced from the score "
-            "tensor we accumulated%s\n", (long long) (ct - cm), (long long) ct,
+        LOG("\n  SELF-CHECK: %lld of %lld token-selections valid from the score "
+            "tensor we accumulated (%lld exact-id, %lld cutoff-tie equivalent)%s\n",
+            (long long) (ct - cm), (long long) ct,
+            (long long) (ct - cm - selfcheck_tie_equivalent),
+            (long long) selfcheck_tie_equivalent,
             nc ? " (WARNING: non-contiguous score tensor seen)" : "");
         if (ct == 0) {
             LOG("  no comparison was possible - the score and topk tensors never "
@@ -664,8 +729,8 @@ int main(int argc, char ** argv) {
                 "  from this run are INVALID. Counting results are unaffected: they\n"
                 "  come from ffn_moe_topk directly.\n", 100.0 * (double) cm / (double) ct);
         } else {
-            LOG("  exact agreement - the reachability results rest on the score the\n"
-                "  router actually compared.\n");
+            LOG("  ordering agreement - the reachability results rest on the score\n"
+                "  the router compared; exact cutoff ties are reported separately.\n");
         }
     }
 

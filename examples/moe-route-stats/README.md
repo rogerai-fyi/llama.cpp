@@ -25,6 +25,11 @@ One streaming pass over your prompts, observing tensors llama.cpp already names
   running max of pairwise differences
 - per-neuron gate maxima inside each expert
 
+Token-hash routed layers (for example, DeepSeek-V4's early
+`ffn_gate_tid2eid` layers) are labeled separately. Their actual selections
+contribute to traffic histograms, but they are excluded from score-based
+reachability because no learned selection score exists for those layers.
+
 The collector reads non-contiguous tensors through their recorded strides. It
 elects the score tensor that reproduces the model's actual top-k, verifies the
 choice on subsequent tokens, serializes the agreement result, and exits nonzero
@@ -35,10 +40,14 @@ if no comparison occurred or any token-selection differs.
 ```
 llama-moe-route-stats -m model.gguf -f prompts.txt -ngl 0 -c 1024
 MOE_STATS_OUT=stats.json llama-moe-route-stats -m model.gguf -f prompts.txt
+MOE_STATS_COLLECT_GATE=1 MOE_STATS_OUT=stats.json llama-moe-route-stats -m model.gguf -f prompts.txt
 ```
 
 One prompt per line. It prints a concentration table and, with `MOE_STATS_OUT`
-set, writes the full statistics for downstream analysis.
+set, writes the full statistics for downstream analysis. Internal expert-gate
+activation capture is intentionally opt-in because it can dominate runtime and
+GPU-to-host traffic on large MoE models; route and router-score collection do
+not require it.
 
 The companion analysis (hull reachability test, ellipsoid test at chosen radii,
 and per-expert routing margins) is not part of llama.cpp; see the project this
