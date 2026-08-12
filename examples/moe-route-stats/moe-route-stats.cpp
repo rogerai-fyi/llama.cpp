@@ -106,6 +106,15 @@ struct route_stats {
     std::map<int, std::map<std::string, std::vector<float>>> cand;  // layer -> name -> scores
     std::map<int, int> cand_ne, cand_nt;
     std::map<int, double> elect_agree;                              // winning agreement rate
+    // WAVEGAUGE: optional per-token top-k sequence dump (MOE_TOPK_DUMP=<path>).
+    // The aggregate histograms cannot answer temporal questions - how sticky the
+    // expert set is token-to-token is exactly what decides whether any prefetch
+    // or residency cache can work, and it is the baseline an MTP-guided
+    // predictor must beat. layer -> flat [k * T] ids, in decode order.
+    std::map<int, std::vector<int32_t>> topk_seq;
+    std::map<int, int> topk_k;
+    std::vector<int64_t> prompt_bounds;   // per-layer token index at each prompt end
+    bool dump_topk = false;
     std::map<int, int64_t> check_tokens;             // tokens compared
     std::map<int, int64_t> check_mismatch;           // non-tie-equivalent set differences
     std::map<int, int64_t> check_tie_equivalent;     // different ids, valid tied top-k
@@ -484,6 +493,14 @@ static bool cb_routes(struct ggml_tensor * t, bool ask, void * user_data) {
             st->n_expert_guess = std::max(st->n_expert_guess, e + 1);
         }
     }
+    if (st->dump_topk) {
+        auto & sq = st->topk_seq[il];
+        st->topk_k[il] = k_used;
+        for (int tk = 0; tk < n_tok; ++tk) {
+            const int32_t * row = (const int32_t *) (base + (size_t) tk * row_stride);
+            sq.insert(sq.end(), row, row + k_used);
+        }
+    }
     return true;
 }
 
@@ -547,6 +564,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    st.dump_topk = getenv("MOE_TOPK_DUMP") != nullptr;
     LOG_INF("%s: %zu prompts\n", __func__, prompts.size());
     for (size_t i = 0; i < prompts.size(); ++i) {
         std::vector<llama_token> tok = common_tokenize(ctx, prompts[i], true, true);
@@ -560,6 +578,11 @@ int main(int argc, char ** argv) {
         if ((i + 1) % 10 == 0) {
             LOG_INF("%s:   %zu/%zu prompts, %lld selections\n",
                     __func__, i + 1, prompts.size(), (long long) st.total_selections);
+        }
+        if (st.dump_topk && !st.topk_seq.empty()) {
+            const auto & first = *st.topk_seq.begin();
+            const int kk = st.topk_k.begin()->second;
+            if (kk > 0) st.prompt_bounds.push_back((int64_t) first.second.size() / kk);
         }
     }
 
@@ -732,6 +755,37 @@ int main(int argc, char ** argv) {
             LOG("  ordering agreement - the reachability results rest on the score\n"
                 "  the router compared; exact cutoff ties are reported separately.\n");
         }
+    }
+
+    if (st.dump_topk) {
+        const char * dp = getenv("MOE_TOPK_DUMP");
+        std::ofstream f(dp);
+        f << "{\n  \"prompt_bounds\": [";
+        for (size_t i = 0; i < st.prompt_bounds.size(); ++i) {
+            if (i) f << ",";
+            f << st.prompt_bounds[i];
+        }
+        f << "],\n  \"k\": {";
+        bool fk = true;
+        for (auto & [il, kk] : st.topk_k) {
+            if (!fk) f << ", ";
+            fk = false;
+            f << "\"" << il << "\": " << kk;
+        }
+        f << "},\n  \"seq\": {\n";
+        bool fl = true;
+        for (auto & [il, sq] : st.topk_seq) {
+            if (!fl) f << ",\n";
+            fl = false;
+            f << "    \"" << il << "\": [";
+            for (size_t i = 0; i < sq.size(); ++i) {
+                if (i) f << ",";
+                f << sq[i];
+            }
+            f << "]";
+        }
+        f << "\n  }\n}\n";
+        LOG("\n  wrote per-token top-k sequences to %s\n", dp);
     }
 
     llama_backend_free();

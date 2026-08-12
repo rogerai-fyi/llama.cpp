@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <fstream>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -329,6 +330,70 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        // MOE_ABLATE=<file> - ablate individual routed experts at load time, for
+        // coverage-vs-quality studies. Each line is "<layer> <expert_id>".
+        //
+        // Implemented by writing a large negative value into the per-expert
+        // selection bias (blk.N.exp_probs_b), which build_moe_ffn adds to the
+        // scores BEFORE top_k. The expert therefore can never be selected, which
+        // is exactly "this expert was removed" semantics - without rebuilding a
+        // 143 GB GGUF per ablation level.
+        //
+        // Only works on architectures that carry exp_probs_b (DeepSeek-style
+        // aux-loss-free load balancing). Absent tensor => loud failure, never a
+        // silent no-op, because a silently-unablated run would look like
+        // "ablation is free".
+        // Skip during the no_alloc fitting probe: common_fit_params does a dry
+        // load to size memory, where tensors have no data and any read aborts
+        // with "tensor not allocated". The real load that follows does the work.
+        if (const char * abl_path = params.no_alloc ? nullptr : getenv("MOE_ABLATE")) {
+            std::ifstream f(abl_path);
+            if (!f) {
+                LLAMA_LOG_ERROR("%s: MOE_ABLATE=%s could not be opened\n", __func__, abl_path);
+                return {-1, nullptr};
+            }
+            std::map<int, std::vector<int>> per_layer;
+            int il = 0, ie = 0;
+            while (f >> il >> ie) {
+                per_layer[il].push_back(ie);
+            }
+            size_t n_done = 0, n_layers = 0;
+            for (const auto & [layer, experts] : per_layer) {
+                // The registered ggml name carries the tn() suffix, so the GGUF
+                // key "blk.N.exp_probs_b" is stored as "blk.N.exp_probs_b.bias".
+                // Try both rather than assuming either.
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%d.exp_probs_b.bias", layer);
+                auto * t = const_cast<ggml_tensor *>(model->get_tensor(name));
+                if (t == nullptr) {
+                    snprintf(name, sizeof(name), "blk.%d.exp_probs_b", layer);
+                    t = const_cast<ggml_tensor *>(model->get_tensor(name));
+                }
+                if (t == nullptr) {
+                    LLAMA_LOG_ERROR("%s: MOE_ABLATE: %s not found - this architecture has no "
+                                    "expert selection bias, so runtime ablation is not "
+                                    "supported here. Refusing to run unablated.\n", __func__, name);
+                    return {-1, nullptr};
+                }
+                const int64_t n_expert = t->ne[0];
+                std::vector<float> b(n_expert);
+                ggml_backend_tensor_get(t, b.data(), 0, n_expert * sizeof(float));
+                for (int e : experts) {
+                    if (e >= 0 && e < n_expert) { b[e] = -1.0e9f; n_done++; }
+                }
+                ggml_backend_tensor_set(t, b.data(), 0, n_expert * sizeof(float));
+                n_layers++;
+            }
+            // fprintf, NOT LLAMA_LOG_INFO: this is a safety confirmation that an
+            // ablation actually engaged, and INFO is filtered at default server
+            // verbosity. A confirmation you can silence with a log level is not a
+            // confirmation - an unablated run would otherwise look identical to an
+            // ablated one, i.e. "ablation is free", the worst failure mode here.
+            fprintf(stderr, "MOE_ABLATE: disabled %zu expert slots across %zu layers (from %s)\n",
+                    n_done, n_layers, abl_path);
+            fflush(stderr);
         }
 
         return {0, model_ptr.release()};
