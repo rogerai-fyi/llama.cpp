@@ -1472,7 +1472,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                // the draft KV cache can be fragmented enough that a wide catch-up ubatch
+                // finds no contiguous slot (rc == 1), which previously failed the whole
+                // request ("failed to process speculative batch"). mirror the server's
+                // main prompt path: decode in chunks, halving the chunk size on rc == 1,
+                // and only fail on a fatal rc or when even a single-row decode cannot be
+                // placed.
+                int32_t rc      = 0;
+                int32_t off     = 0;
+                int32_t n_chunk = batch.n_tokens;
+                while (off < batch.n_tokens) {
+                    const int32_t n_cur = std::min(n_chunk, batch.n_tokens - off);
+
+                    llama_batch view = {
+                        /*.n_tokens =*/ n_cur,
+                        /*.token    =*/ batch.token    ? batch.token    + off : nullptr,
+                        /*.embd     =*/ batch.embd     ? batch.embd     + (size_t) off * n_embd : nullptr,
+                        /*.pos      =*/ batch.pos      + off,
+                        /*.n_seq_id =*/ batch.n_seq_id + off,
+                        /*.seq_id   =*/ batch.seq_id   + off,
+                        /*.logits   =*/ batch.logits   + off,
+                    };
+
+                    rc = llama_decode(ctx_dft, view);
+                    if (rc == 0) {
+                        off += n_cur;
+                        continue;
+                    }
+
+                    if (rc == 1 && n_chunk > 1) {
+                        n_chunk = std::max(1, n_chunk/2);
+                        SPC_WRN("no draft KV slot for %d rows (head=%d), retrying ingest with n_chunk=%d (off=%d/%d, pos=%d)\n",
+                                n_cur, head, n_chunk, off, (int) batch.n_tokens, (int) batch_in.pos[0]);
+                        continue;
+                    }
+
+                    break;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
